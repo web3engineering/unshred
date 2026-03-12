@@ -527,6 +527,7 @@ async fn run_sender(
 struct PumpTradeAddresses {
     global: Pubkey,
     bonding_curve: Pubkey,
+    bonding_curve_v2: Pubkey,
     associated_bonding_curve: Pubkey,
     fee_recipient: Pubkey,
     creator_vault: Pubkey,
@@ -554,6 +555,8 @@ fn derive_pump_trade_addresses(
     let token_program = parse_pubkey(TOKEN_PROGRAM_ID);
     let bonding_curve =
         Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &pump_program).0;
+    let bonding_curve_v2 =
+        Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &pump_program).0;
     let associated_bonding_curve = derive_ata(&bonding_curve, &mint, &token_program);
     let global = Pubkey::find_program_address(&[b"global"], &pump_program).0;
     let global_volume_accumulator =
@@ -565,6 +568,7 @@ fn derive_pump_trade_addresses(
     PumpTradeAddresses {
         global,
         bonding_curve,
+        bonding_curve_v2,
         associated_bonding_curve,
         fee_recipient: parse_pubkey(PUMP_FEE_RECIPIENT),
         creator_vault,
@@ -628,6 +632,7 @@ fn build_buy_exact_sol_in_ix(
             AccountMeta::new(user_volume_accumulator, false),
             AccountMeta::new_readonly(parse_pubkey(PUMP_FEE_CONFIG_ACCOUNT), false),
             AccountMeta::new_readonly(parse_pubkey(PUMP_FEE_PROGRAM), false),
+            AccountMeta::new(addresses.bonding_curve_v2, false),
         ],
         data,
     }
