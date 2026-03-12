@@ -2,3 +2,5 @@ target/
 data/
 *.env
 *.tar.gz
+keypair.json
+.tmp/
