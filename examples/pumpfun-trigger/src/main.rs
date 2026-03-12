@@ -604,11 +604,10 @@ fn build_buy_exact_sol_in_ix(
         Pubkey::find_program_address(&[b"user_volume_accumulator", buyer.as_ref()], &pump_program)
             .0;
 
-    let mut data = vec![0u8; 25];
+    let mut data = vec![0u8; 24];
     data[0..8].copy_from_slice(&BUY_EXACT_SOL_IN_DISCRIMINATOR);
     data[8..16].copy_from_slice(&sol_amount.to_le_bytes());
     data[16..24].copy_from_slice(&min_token_amount.to_le_bytes());
-    data[24] = 1;
 
     Instruction {
         program_id: pump_program,

@@ -7,7 +7,7 @@ Low-latency trigger example built on `unshred`:
 - keeps Falcon sender connection warm
 - continuously caches finalized blockhashes for hot-path use
 - on trigger, derives creator vault from `create` instruction, signs, and sends tx:
-  `CU price`, `CU limit`, `create_ata`, `buy_exact_quote`, optional Falcon tip transfer
+  `CU price`, `CU limit`, `create_ata`, `buy_exact_sol_in`, optional Falcon tip transfer
 - in non-`dry-run` mode, also appends a SOL tip transfer to
   `Fa1con1i7mpa7Qc6epYJ6r4P9AbU77DFFz173r59Df1x` using `--tip-sol`
 - logs trigger latency (`handler_to_send_us`)
