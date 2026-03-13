@@ -610,8 +610,8 @@ fn build_buy_exact_sol_in_ix(
 
     let mut data = vec![0u8; 24];
     data[0..8].copy_from_slice(&BUY_EXACT_SOL_IN_DISCRIMINATOR);
-    data[8..16].copy_from_slice(&min_token_amount.to_le_bytes());
-    data[16..24].copy_from_slice(&sol_amount.to_le_bytes());
+    data[8..16].copy_from_slice(&sol_amount.to_le_bytes());
+    data[16..24].copy_from_slice(&min_token_amount.to_le_bytes());
 
     Instruction {
         program_id: pump_program,
