@@ -64,7 +64,7 @@ struct Args {
 
     #[arg(
         long,
-        help = "Path to signer keypair file used to sign locally-built transactions"
+        help = "Comma-separated paths to signer keypair files"
     )]
     signer_keypair: Option<String>,
 
@@ -74,11 +74,17 @@ struct Args {
     #[arg(long, default_value_t = 1_000_000)]
     compute_unit_price_micro_lamports: u64,
 
-    #[arg(long, default_value_t = 1_000_000)]
-    buy_exact_sol_amount: u64,
+    #[arg(
+        long,
+        help = "Comma-separated SOL amounts (in lamports) for each wallet, must match keypair count"
+    )]
+    buy_exact_sol_amount: String,
 
-    #[arg(long, default_value_t = 0)]
-    buy_exact_min_token_amount: u64,
+    #[arg(
+        long,
+        help = "Comma-separated minimum token amounts for each wallet, must match keypair count"
+    )]
+    buy_exact_min_token_amount: String,
 
     #[arg(long, default_value = DEFAULT_SENDER_URL)]
     sender_url: String,
@@ -351,12 +357,92 @@ async fn main() -> Result<()> {
 
     let (trigger_tx, trigger_rx) = mpsc::channel::<TriggerEvent>(1);
     let (blockhash_tx, blockhash_rx) = watch::channel::<Option<Hash>>(None);
-    let signer_path = args
+
+    // Parse comma-separated keypair paths
+    let signer_paths_str = args
         .signer_keypair
         .as_ref()
         .ok_or_else(|| anyhow!("--signer-keypair is required"))?;
-    let signer = read_keypair_file(signer_path)
-        .map_err(|e| anyhow!("failed reading keypair file `{signer_path}`: {e}"))?;
+    let signer_paths: Vec<&str> = signer_paths_str.split(',').map(|s| s.trim()).collect();
+
+    // Parse comma-separated SOL amounts
+    let sol_amounts: Result<Vec<u64>> = args
+        .buy_exact_sol_amount
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u64>()
+                .context(format!("failed to parse SOL amount: {}", s.trim()))
+        })
+        .collect();
+    let sol_amounts = sol_amounts?;
+
+    // Parse comma-separated token amounts
+    let token_amounts: Result<Vec<u64>> = args
+        .buy_exact_min_token_amount
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u64>()
+                .context(format!("failed to parse token amount: {}", s.trim()))
+        })
+        .collect();
+    let token_amounts = token_amounts?;
+
+    // Validate all arrays have the same length
+    if signer_paths.len() != sol_amounts.len() || signer_paths.len() != token_amounts.len() {
+        return Err(anyhow!(
+            "keypair count ({}), SOL amounts count ({}), and token amounts count ({}) must all match",
+            signer_paths.len(),
+            sol_amounts.len(),
+            token_amounts.len()
+        ));
+    }
+
+    if signer_paths.is_empty() {
+        return Err(anyhow!("at least one keypair must be provided"));
+    }
+
+    // Load all keypairs
+    let signers: Result<Vec<Keypair>> = signer_paths
+        .iter()
+        .map(|path| {
+            read_keypair_file(path)
+                .map_err(|e| anyhow!("failed reading keypair file `{}`: {}", path, e))
+        })
+        .collect();
+    let signers = signers?;
+
+    info!(
+        wallet_count = signers.len(),
+        wallets = ?signers.iter().map(|s| s.pubkey().to_string()).collect::<Vec<_>>(),
+        "loaded {} wallet(s)",
+        signers.len()
+    );
+
+    // Pre-compute per-wallet data
+    let precomputed_wallets: Vec<PrecomputedWallet> = signers
+        .into_iter()
+        .zip(sol_amounts.iter())
+        .zip(token_amounts.iter())
+        .map(|((signer, &sol_amount), &token_amount)| {
+            precompute_wallet_data(
+                signer,
+                sol_amount,
+                token_amount,
+                args.pump_program_id,
+                args.expected_mint,
+                args.compute_unit_limit,
+                args.compute_unit_price_micro_lamports,
+            )
+        })
+        .collect();
+
+    info!(
+        "pre-computed {} wallet transaction templates",
+        precomputed_wallets.len()
+    );
+
     let tip_lamports = tip_sol_to_lamports(args.tip_sol)?;
     let base_addresses =
         derive_pump_trade_addresses(args.pump_program_id, args.expected_mint, None);
@@ -387,7 +473,7 @@ async fn main() -> Result<()> {
     tokio::spawn(run_sender(
         http,
         args.clone(),
-        signer,
+        precomputed_wallets,
         tip_lamports,
         base_addresses,
         blockhash_rx,
@@ -423,19 +509,22 @@ async fn main() -> Result<()> {
 async fn run_sender(
     http: Client,
     args: Args,
-    signer: Keypair,
+    precomputed_wallets: Vec<PrecomputedWallet>,
     tip_lamports: u64,
     base_addresses: PumpTradeAddresses,
     blockhash_rx: watch::Receiver<Option<Hash>>,
     mut trigger_rx: mpsc::Receiver<TriggerEvent>,
 ) {
     info!(
-        signer = %signer.pubkey(),
+        signers = ?precomputed_wallets.iter().map(|w| w.signer.pubkey().to_string()).collect::<Vec<_>>(),
         mint = %args.expected_mint,
         pump_program = %args.pump_program_id,
         tip_sol = args.tip_sol,
         tip_lamports,
-        "tx template ready; waiting for create triggers"
+        sol_amounts = ?precomputed_wallets.iter().map(|w| w.sol_amount).collect::<Vec<_>>(),
+        token_amounts = ?precomputed_wallets.iter().map(|w| w.min_token_amount).collect::<Vec<_>>(),
+        "pre-computed tx templates ready for {} wallet(s); waiting for create triggers",
+        precomputed_wallets.len()
     );
 
     while let Some(trigger) = trigger_rx.recv().await {
@@ -445,7 +534,9 @@ async fn run_sender(
             extracted_mint = %trigger.extracted_mint,
             extracted_creator = ?trigger.extracted_creator,
             handler_to_send_us = trigger.received_at.elapsed().as_micros() as u64,
-            "trigger matched"
+            wallet_count = precomputed_wallets.len(),
+            "trigger matched, sending {} transaction(s)",
+            precomputed_wallets.len()
         );
         let Some(creator) = trigger.extracted_creator else {
             warn!("trigger matched but creator account was not extracted");
@@ -473,52 +564,90 @@ async fn run_sender(
             (args.expected_mint, addresses)
         };
 
-        match build_signed_trade_tx(
-            blockhash,
-            &signer,
-            args.pump_program_id,
-            tx_mint,
-            addresses,
-            args.compute_unit_limit,
-            args.compute_unit_price_micro_lamports,
-            args.buy_exact_sol_amount,
-            args.buy_exact_min_token_amount,
-            tip_lamports,
-        ) {
-            Ok(tx) => {
-                let local_sig = tx.signatures.first().copied().unwrap_or_default();
-                #[cfg(not(feature = "dry-run"))]
-                match send_signed_transaction(&http, &args.sender_url, &tx).await {
-                    Ok(remote_sig) => {
+        // Send transactions for all wallets sequentially
+        for (wallet_idx, wallet) in precomputed_wallets.iter().enumerate() {
+            let signer_pubkey = wallet.signer.pubkey();
+            let sol_amount = wallet.sol_amount;
+            let token_amount = wallet.min_token_amount;
+
+            #[cfg(feature = "no-filter")]
+            let tx_result = build_signed_trade_tx(
+                blockhash,
+                &wallet.signer,
+                args.pump_program_id,
+                tx_mint,
+                addresses,
+                args.compute_unit_limit,
+                args.compute_unit_price_micro_lamports,
+                sol_amount,
+                token_amount,
+                tip_lamports,
+            );
+
+            #[cfg(not(feature = "no-filter"))]
+            let tx_result = build_signed_trade_tx_fast(
+                blockhash,
+                wallet,
+                args.pump_program_id,
+                tx_mint,
+                addresses,
+                tip_lamports,
+            );
+
+            match tx_result {
+                Ok(tx) => {
+                    let local_sig = tx.signatures.first().copied().unwrap_or_default();
+
+                    #[cfg(not(feature = "dry-run"))]
+                    match send_signed_transaction(&http, &args.sender_url, &tx).await {
+                        Ok(remote_sig) => {
+                            info!(
+                                wallet_idx,
+                                signer = %signer_pubkey,
+                                slot = trigger.slot,
+                                mint = %tx_mint,
+                                creator = %creator,
+                                creator_vault = %addresses.creator_vault,
+                                blockhash = %blockhash,
+                                local_sig = %local_sig,
+                                remote_sig = %remote_sig,
+                                sol_amount,
+                                token_amount,
+                                trigger_to_send_us = trigger.received_at.elapsed().as_micros() as u64,
+                                "signed and sent buy_exact_sol_in transaction"
+                            );
+                        }
+                        Err(e) => warn!(
+                            wallet_idx,
+                            signer = %signer_pubkey,
+                            "failed to send transaction: {e}"
+                        ),
+                    }
+
+                    #[cfg(feature = "dry-run")]
+                    {
                         info!(
+                            wallet_idx,
+                            signer = %signer_pubkey,
                             slot = trigger.slot,
                             mint = %tx_mint,
                             creator = %creator,
                             creator_vault = %addresses.creator_vault,
                             blockhash = %blockhash,
                             local_sig = %local_sig,
-                            remote_sig = %remote_sig,
-                            trigger_to_send_us = trigger.received_at.elapsed().as_micros() as u64,
-                            "signed and sent buy_exact_sol_in transaction"
+                            sol_amount,
+                            token_amount,
+                            "dry-run: transaction signed (not sent)"
                         );
+                        dispatch_placeholder(&http, &args.sender_url).await;
                     }
-                    Err(e) => warn!("failed to send transaction: {e}"),
                 }
-                #[cfg(feature = "dry-run")]
-                {
-                    info!(
-                        slot = trigger.slot,
-                        mint = %tx_mint,
-                        creator = %creator,
-                        creator_vault = %addresses.creator_vault,
-                        blockhash = %blockhash,
-                        local_sig = %local_sig,
-                        "dry-run: transaction signed (not sent)"
-                    );
-                    dispatch_placeholder(&http, &args.sender_url).await;
-                }
+                Err(e) => warn!(
+                    wallet_idx,
+                    signer = %signer_pubkey,
+                    "failed to build/sign tx: {e}"
+                ),
             }
-            Err(e) => warn!("failed to build/sign tx: {e}"),
         }
     }
 }
@@ -535,8 +664,51 @@ struct PumpTradeAddresses {
     global_volume_accumulator: Pubkey,
 }
 
+struct PrecomputedWallet {
+    signer: Keypair,
+    sol_amount: u64,
+    min_token_amount: u64,
+    user_token_ata: Pubkey,
+    user_volume_accumulator: Pubkey,
+    compute_ixs: Vec<Instruction>,
+    create_ata_ix: Instruction,
+}
+
 fn parse_pubkey(value: &str) -> Pubkey {
     Pubkey::from_str(value).expect("static pubkey constant must be valid")
+}
+
+fn precompute_wallet_data(
+    signer: Keypair,
+    sol_amount: u64,
+    min_token_amount: u64,
+    pump_program: Pubkey,
+    mint: Pubkey,
+    cu_limit: u32,
+    cu_price_micro_lamports: u64,
+) -> PrecomputedWallet {
+    let token_program = parse_pubkey(TOKEN_PROGRAM_ID);
+    let payer = signer.pubkey();
+    let user_token_ata = derive_ata(&payer, &mint, &token_program);
+    let user_volume_accumulator =
+        Pubkey::find_program_address(&[b"user_volume_accumulator", payer.as_ref()], &pump_program).0;
+
+    let compute_ixs = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
+        ComputeBudgetInstruction::set_compute_unit_price(cu_price_micro_lamports),
+    ];
+
+    let create_ata_ix = build_create_ata_idempotent_ix(payer, payer, mint);
+
+    PrecomputedWallet {
+        signer,
+        sol_amount,
+        min_token_amount,
+        user_token_ata,
+        user_volume_accumulator,
+        compute_ixs,
+        create_ata_ix,
+    }
 }
 
 fn derive_ata(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
@@ -594,6 +766,7 @@ fn build_create_ata_idempotent_ix(payer: Pubkey, owner: Pubkey, mint: Pubkey) ->
     }
 }
 
+#[cfg_attr(not(feature = "no-filter"), allow(dead_code))]
 fn build_buy_exact_sol_in_ix(
     pump_program: Pubkey,
     mint: Pubkey,
@@ -638,6 +811,7 @@ fn build_buy_exact_sol_in_ix(
     }
 }
 
+#[cfg_attr(not(feature = "no-filter"), allow(dead_code))]
 fn build_signed_trade_tx(
     recent_blockhash: Hash,
     signer: &Keypair,
@@ -675,6 +849,67 @@ fn build_signed_trade_tx(
     let message = Message::new(&ixs, Some(&payer));
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&[signer], recent_blockhash)
+        .context("failed to sign transaction")?;
+    Ok(tx)
+}
+
+fn build_signed_trade_tx_fast(
+    recent_blockhash: Hash,
+    wallet: &PrecomputedWallet,
+    pump_program: Pubkey,
+    mint: Pubkey,
+    addresses: PumpTradeAddresses,
+    tip_lamports: u64,
+) -> Result<Transaction> {
+    let payer = wallet.signer.pubkey();
+
+    // Build buy instruction with pre-computed data
+    let mut buy_ix_data = vec![0u8; 24];
+    buy_ix_data[0..8].copy_from_slice(&BUY_EXACT_SOL_IN_DISCRIMINATOR);
+    buy_ix_data[8..16].copy_from_slice(&wallet.sol_amount.to_le_bytes());
+    buy_ix_data[16..24].copy_from_slice(&wallet.min_token_amount.to_le_bytes());
+
+    let token_program = parse_pubkey(TOKEN_PROGRAM_ID);
+    let buy_ix = Instruction {
+        program_id: pump_program,
+        accounts: vec![
+            AccountMeta::new_readonly(addresses.global, false),
+            AccountMeta::new(addresses.fee_recipient, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(addresses.bonding_curve, false),
+            AccountMeta::new(addresses.associated_bonding_curve, false),
+            AccountMeta::new(wallet.user_token_ata, false),
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new(addresses.creator_vault, false),
+            AccountMeta::new_readonly(addresses.event_authority, false),
+            AccountMeta::new_readonly(pump_program, false),
+            AccountMeta::new(addresses.global_volume_accumulator, false),
+            AccountMeta::new(wallet.user_volume_accumulator, false),
+            AccountMeta::new_readonly(parse_pubkey(PUMP_FEE_CONFIG_ACCOUNT), false),
+            AccountMeta::new_readonly(parse_pubkey(PUMP_FEE_PROGRAM), false),
+            AccountMeta::new(addresses.bonding_curve_v2, false),
+        ],
+        data: buy_ix_data,
+    };
+
+    let mut ixs = wallet.compute_ixs.clone();
+    ixs.push(wallet.create_ata_ix.clone());
+    ixs.push(buy_ix);
+
+    #[cfg(not(feature = "dry-run"))]
+    if tip_lamports > 0 {
+        ixs.push(system_instruction::transfer(
+            &payer,
+            &parse_pubkey(FALCON_TIP_ACCOUNT),
+            tip_lamports,
+        ));
+    }
+
+    let message = Message::new(&ixs, Some(&payer));
+    let mut tx = Transaction::new_unsigned(message);
+    tx.try_sign(&[&wallet.signer], recent_blockhash)
         .context("failed to sign transaction")?;
     Ok(tx)
 }
