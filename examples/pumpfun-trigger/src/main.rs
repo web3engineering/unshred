@@ -584,13 +584,16 @@ async fn run_sender(
             (args.expected_mint, addresses)
         };
 
-        // Send transactions for all wallets sequentially
+        // Build all transactions (sync, fast), then send all in parallel
+        let total_wallets = precomputed_wallets.len();
+        let mut handles = Vec::with_capacity(total_wallets);
+
         for (wallet_idx, wallet) in precomputed_wallets.iter().enumerate() {
             let signer_pubkey = wallet.signer.pubkey();
             let sol_amount = wallet.sol_amount;
             let token_amount = wallet.min_token_amount;
-            let url_idx = (wallet_idx * sender_urls.len()) / precomputed_wallets.len();
-            let sender_url = &sender_urls[url_idx.min(sender_urls.len() - 1)];
+            let url_idx = (wallet_idx * sender_urls.len()) / total_wallets;
+            let sender_url = sender_urls[url_idx.min(sender_urls.len() - 1)].clone();
 
             #[cfg(feature = "no-filter")]
             let tx_result = build_signed_trade_tx(
@@ -618,15 +621,18 @@ async fn run_sender(
 
             match tx_result {
                 Ok(tx) => {
-                    let local_sig = tx.signatures.first().copied().unwrap_or_default();
+                    let http = http.clone();
+                    let slot = trigger.slot;
+                    let received_at = trigger.received_at;
+                    handles.push(tokio::spawn(async move {
+                        let local_sig = tx.signatures.first().copied().unwrap_or_default();
 
-                    #[cfg(not(feature = "dry-run"))]
-                    match send_signed_transaction(&http, sender_url, &tx).await {
-                        Ok(remote_sig) => {
-                            info!(
+                        #[cfg(not(feature = "dry-run"))]
+                        match send_signed_transaction(&http, &sender_url, &tx).await {
+                            Ok(remote_sig) => info!(
                                 wallet_idx,
                                 signer = %signer_pubkey,
-                                slot = trigger.slot,
+                                slot,
                                 mint = %tx_mint,
                                 creator = %creator,
                                 creator_vault = %addresses.creator_vault,
@@ -636,36 +642,36 @@ async fn run_sender(
                                 sol_amount,
                                 token_amount,
                                 sender_url = %sender_url,
-                                trigger_to_send_us = trigger.received_at.elapsed().as_micros() as u64,
+                                trigger_to_send_us = received_at.elapsed().as_micros() as u64,
                                 "signed and sent buy_exact_sol_in transaction"
-                            );
+                            ),
+                            Err(e) => warn!(
+                                wallet_idx,
+                                signer = %signer_pubkey,
+                                sender_url = %sender_url,
+                                "failed to send transaction: {e}"
+                            ),
                         }
-                        Err(e) => warn!(
-                            wallet_idx,
-                            signer = %signer_pubkey,
-                            sender_url = %sender_url,
-                            "failed to send transaction: {e}"
-                        ),
-                    }
 
-                    #[cfg(feature = "dry-run")]
-                    {
-                        info!(
-                            wallet_idx,
-                            signer = %signer_pubkey,
-                            slot = trigger.slot,
-                            mint = %tx_mint,
-                            creator = %creator,
-                            creator_vault = %addresses.creator_vault,
-                            blockhash = %blockhash,
-                            local_sig = %local_sig,
-                            sol_amount,
-                            token_amount,
-                            sender_url = %sender_url,
-                            "dry-run: transaction signed (not sent)"
-                        );
-                        dispatch_placeholder(&http, sender_url).await;
-                    }
+                        #[cfg(feature = "dry-run")]
+                        {
+                            info!(
+                                wallet_idx,
+                                signer = %signer_pubkey,
+                                slot,
+                                mint = %tx_mint,
+                                creator = %creator,
+                                creator_vault = %addresses.creator_vault,
+                                blockhash = %blockhash,
+                                local_sig = %local_sig,
+                                sol_amount,
+                                token_amount,
+                                sender_url = %sender_url,
+                                "dry-run: transaction signed (not sent)"
+                            );
+                            dispatch_placeholder(&http, &sender_url).await;
+                        }
+                    }));
                 }
                 Err(e) => warn!(
                     wallet_idx,
@@ -673,6 +679,10 @@ async fn run_sender(
                     "failed to build/sign tx: {e}"
                 ),
             }
+        }
+
+        for handle in handles {
+            let _ = handle.await;
         }
     }
 }
