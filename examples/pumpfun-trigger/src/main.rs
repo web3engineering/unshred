@@ -589,7 +589,8 @@ async fn run_sender(
             let signer_pubkey = wallet.signer.pubkey();
             let sol_amount = wallet.sol_amount;
             let token_amount = wallet.min_token_amount;
-            let sender_url = &sender_urls[wallet_idx.min(sender_urls.len() - 1)];
+            let url_idx = (wallet_idx * sender_urls.len()) / precomputed_wallets.len();
+            let sender_url = &sender_urls[url_idx.min(sender_urls.len() - 1)];
 
             #[cfg(feature = "no-filter")]
             let tx_result = build_signed_trade_tx(
