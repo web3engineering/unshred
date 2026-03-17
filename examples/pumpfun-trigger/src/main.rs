@@ -86,7 +86,11 @@ struct Args {
     )]
     buy_exact_min_token_amount: String,
 
-    #[arg(long, default_value = DEFAULT_SENDER_URL)]
+    #[arg(
+        long,
+        default_value = DEFAULT_SENDER_URL,
+        help = "Comma-separated sender URLs; wallet[i] uses url[i], extras use last url"
+    )]
     sender_url: String,
 
     #[arg(long, default_value_t = 0.0)]
@@ -453,12 +457,25 @@ async fn main() -> Result<()> {
         .build()
         .context("failed building reqwest client")?;
 
+    let sender_urls: Vec<String> = args
+        .sender_url
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sender_urls.is_empty() {
+        return Err(anyhow!("--sender-url must contain at least one URL"));
+    }
+    info!(sender_url_count = sender_urls.len(), urls = ?sender_urls, "sender URLs loaded");
+
     #[cfg(not(feature = "dry-run"))]
-    tokio::spawn(run_sender_keepalive(
-        http.clone(),
-        args.sender_url.clone(),
-        Duration::from_secs(2),
-    ));
+    for url in &sender_urls {
+        tokio::spawn(run_sender_keepalive(
+            http.clone(),
+            url.clone(),
+            Duration::from_secs(2),
+        ));
+    }
 
     tokio::spawn({
         let rpc_url = args.rpc_url.clone();
@@ -473,6 +490,7 @@ async fn main() -> Result<()> {
     tokio::spawn(run_sender(
         http,
         args.clone(),
+        sender_urls,
         precomputed_wallets,
         tip_lamports,
         base_addresses,
@@ -509,6 +527,7 @@ async fn main() -> Result<()> {
 async fn run_sender(
     http: Client,
     args: Args,
+    sender_urls: Vec<String>,
     precomputed_wallets: Vec<PrecomputedWallet>,
     tip_lamports: u64,
     base_addresses: PumpTradeAddresses,
@@ -523,6 +542,7 @@ async fn run_sender(
         tip_lamports,
         sol_amounts = ?precomputed_wallets.iter().map(|w| w.sol_amount).collect::<Vec<_>>(),
         token_amounts = ?precomputed_wallets.iter().map(|w| w.min_token_amount).collect::<Vec<_>>(),
+        sender_url_count = sender_urls.len(),
         "pre-computed tx templates ready for {} wallet(s); waiting for create triggers",
         precomputed_wallets.len()
     );
@@ -569,6 +589,7 @@ async fn run_sender(
             let signer_pubkey = wallet.signer.pubkey();
             let sol_amount = wallet.sol_amount;
             let token_amount = wallet.min_token_amount;
+            let sender_url = &sender_urls[wallet_idx.min(sender_urls.len() - 1)];
 
             #[cfg(feature = "no-filter")]
             let tx_result = build_signed_trade_tx(
@@ -599,7 +620,7 @@ async fn run_sender(
                     let local_sig = tx.signatures.first().copied().unwrap_or_default();
 
                     #[cfg(not(feature = "dry-run"))]
-                    match send_signed_transaction(&http, &args.sender_url, &tx).await {
+                    match send_signed_transaction(&http, sender_url, &tx).await {
                         Ok(remote_sig) => {
                             info!(
                                 wallet_idx,
@@ -613,6 +634,7 @@ async fn run_sender(
                                 remote_sig = %remote_sig,
                                 sol_amount,
                                 token_amount,
+                                sender_url = %sender_url,
                                 trigger_to_send_us = trigger.received_at.elapsed().as_micros() as u64,
                                 "signed and sent buy_exact_sol_in transaction"
                             );
@@ -620,6 +642,7 @@ async fn run_sender(
                         Err(e) => warn!(
                             wallet_idx,
                             signer = %signer_pubkey,
+                            sender_url = %sender_url,
                             "failed to send transaction: {e}"
                         ),
                     }
@@ -637,9 +660,10 @@ async fn run_sender(
                             local_sig = %local_sig,
                             sol_amount,
                             token_amount,
+                            sender_url = %sender_url,
                             "dry-run: transaction signed (not sent)"
                         );
-                        dispatch_placeholder(&http, &args.sender_url).await;
+                        dispatch_placeholder(&http, sender_url).await;
                     }
                 }
                 Err(e) => warn!(

@@ -4,3 +4,5 @@ data/
 *.tar.gz
 keypair.json
 .tmp/
+node_modules/
+ideas/
